@@ -249,3 +249,468 @@ export function run(input) {
   }
   return { columns: header ? (columns ?? []) : null, rows, errors };
 }
+
+// ---------------------------------------------------------------------------
+// Byte-level JSON-through parsing (round 3): parse CSV directly on a raw JSON
+// string span — the escaped content of a "text" value inside cases.json — and
+// return the answer as a JSON string, byte-identical to
+// JSON.stringify(run(decoded text)).
+//
+// Why: the house driver pays JSON.parse(cases.json, 11 MB) + JSON.stringify
+// (answers, 12 MB) + building the full answer objects, ~0.55 s end to end.
+// This parser never materialises the decoded text or the answer objects.
+//
+// Raw-span facts it relies on (all true for any JSON.stringify output):
+//   - a field's raw bytes ARE its JSON.stringify-escaped form whenever the
+//     field holds no \r / \n / \u escape: \" stays \", \\ stays \\, \t stays
+//     \t. Only fields holding a \r or \n escape (embedded line break / stray
+//     CR) or a doubled quote need a decode + re-escape slow path.
+//   - a closing quote is the raw two characters \" ; a doubled quote is \"\".
+//   - a record break is the raw two characters \n, or \r\n (four characters).
+// Any \u escape throws RawFallback: the caller then decodes that case with
+// JSON.parse and answers it with run() above, so correctness holds for every
+// input while the fast path covers 100% of generator output (which has no \u).
+// ---------------------------------------------------------------------------
+
+/** Thrown when a case needs the decoded path (a \u escape was met). */
+export class RawFallback extends Error {
+  constructor() {
+    super('csv-reader-raw-fallback');
+    this.name = 'RawFallback';
+  }
+}
+
+const FALLBACK = new RawFallback();
+
+/** The four hex digits at p as a number, or -1. */
+function hex4(s, p) {
+  let v = 0;
+  for (let i = 0; i < 4; i++) {
+    const c = s.charCodeAt(p + i);
+    let d;
+    if (c >= 48 && c <= 57) d = c - 48;
+    else if (c >= 97 && c <= 102) d = c - 87;
+    else if (c >= 65 && c <= 70) d = c - 55;
+    else return -1;
+    v = v * 16 + d;
+  }
+  return v;
+}
+
+/** A raw JSON string-content span decoded to its JS string (short strings only). */
+function decodeRawSpan(raw) {
+  return JSON.parse('"' + raw + '"');
+}
+
+/** How many '\n' the string holds. */
+function countLF(str) {
+  let d = 0;
+  let idx = str.indexOf('\n');
+  while (idx !== -1) {
+    d += 1;
+    idx = str.indexOf('\n', idx + 1);
+  }
+  return d;
+}
+
+/**
+ * Parse one case straight off the raw JSON file string: the case text's raw
+ * content is s[start..end), header is the case's header flag. Returns the
+ * answer as a JSON string, byte-identical to JSON.stringify(run({text, header})).
+ *
+ * No JSON.parse of the text, no answer objects: a field's raw bytes ARE its
+ * JSON.stringify-escaped form whenever it holds no \r / \n escape and no
+ * doubled quote, so most fields are emitted verbatim from the raw slice.
+ * Fields that do hold a line break or a doubled quote are rebuilt from the
+ * raw segments with string transforms (no JSON.parse); JSON.parse is kept
+ * only for the never-in-practice case of a literal backslash (\\) inside
+ * such a field. Any \u escape throws RawFallback: the caller then decodes
+ * that case with JSON.parse and answers it with run().
+ */
+export function runJson(s, start, end, header) {
+  const errs = []; // error JSON strings, in order met
+  const rowsParts = []; // row JSON strings
+  let columnsJson = null;
+  let width = -1;
+  let rowsCount = 0;
+
+  let pos = start;
+  let line = 1;
+  if (pos < end && s.charCodeAt(pos) === 0xfeff) {
+    pos += 1; // literal BOM
+  } else if (pos + 6 <= end && s.charCodeAt(pos) === 92 && s.charCodeAt(pos + 1) === 117) {
+    if (hex4(s, pos + 2) === 0xfeff) pos += 6; // \ufeff BOM
+    else throw FALLBACK;
+  }
+
+  let recordLine = 1;
+  let recordRow = null;
+
+  // The last field read: how it ended, its emitted content (no surrounding
+  // quotes), whether its decoded value is empty, and how many decoded
+  // characters the last junk read kept (quote_junk check).
+  let fEnded = END;
+  let fEmitted = '';
+  let fEmpty = true;
+  let fAdded = 0;
+  let fQuoted = false;
+
+  function errJson(code, extra) {
+    return (
+      '{"code":"' +
+      code +
+      '","line":' +
+      recordLine +
+      ',"row":' +
+      (recordRow === null ? 'null' : recordRow) +
+      (extra || '') +
+      '}'
+    );
+  }
+
+  // Reads an unquoted field starting at pos. Sets fEnded / fEmitted / fEmpty /
+  // fAdded (decoded characters kept by this read). The segment up to the next
+  // comma is sliced once; its escapes are walked on that short slice, never
+  // by an unbounded scan for the next backslash.
+  function readUnquotedRaw() {
+    const fieldStart = pos;
+    let p = pos;
+    let pieceStart = fieldStart;
+    let pieces = null; // raw pieces, only once a stray \r splits the field
+    let transparent = 0; // transparent 2-char escapes met (each: 1 decoded char)
+    let stray = 0; // stray \r escapes met (each: 0 decoded chars)
+    let ended = END;
+    let endRaw = end;
+    outer: for (;;) {
+      const iC = s.indexOf(',', p);
+      const segEnd = iC === -1 || iC >= end ? end : iC;
+      const seg = s.slice(p, segEnd);
+      let k = seg.indexOf('\\');
+      while (k !== -1) {
+        const t = seg.charCodeAt(k + 1);
+        if (t === 110) {
+          // \n: the line break ends the field.
+          endRaw = p + k;
+          pos = p + k + 2;
+          line += 1;
+          ended = LINE_BREAK;
+          break outer;
+        }
+        if (t === 114) {
+          // \r: CRLF when a \n escape follows, else a stray CR (dropped).
+          if (seg.charCodeAt(k + 2) === 92 && seg.charCodeAt(k + 3) === 110) {
+            endRaw = p + k;
+            pos = p + k + 4;
+            line += 1;
+            ended = LINE_BREAK;
+            break outer;
+          }
+          errs.push(errJson('stray_cr'));
+          if (pieces === null) pieces = [];
+          pieces.push(s.slice(pieceStart, p + k));
+          stray += 1;
+          p = p + k + 2;
+          pieceStart = p;
+          continue outer;
+        }
+        if (t === 117) throw FALLBACK; // \u: the decoded path handles it
+        // \" \\ \t \b \f \/: transparent — the escape stays in the piece.
+        transparent += 1;
+        k = seg.indexOf('\\', k + 2);
+      }
+      // No (more) escapes in this segment: the field ends at the comma / end.
+      if (iC !== -1 && iC < end) {
+        endRaw = segEnd;
+        pos = segEnd + 1;
+        ended = COMMA;
+      } else {
+        endRaw = end;
+        pos = end;
+        ended = END;
+      }
+      break;
+    }
+    const totalRaw = endRaw - fieldStart;
+    const decodedLen = totalRaw - transparent - 2 * stray;
+    fEnded = ended;
+    fAdded = decodedLen;
+    fEmpty = decodedLen === 0;
+    if (pieces === null) {
+      fEmitted = s.slice(fieldStart, endRaw);
+      return;
+    }
+    pieces.push(s.slice(pieceStart, endRaw));
+    // The pieces are the raw content with the stray \r escapes removed; every
+    // escape left in them passes through verbatim, so this IS the emitted form.
+    fEmitted = pieces.join('');
+  }
+
+  // What follows a quoted field's closing quote (pos is just past it);
+  // qEmitted is the quoted field's emitted content.
+  function afterQuoteRaw(qEmitted) {
+    fQuoted = true;
+    fEmpty = false;
+    if (pos >= end) {
+      fEnded = END;
+      fEmitted = qEmitted;
+      return;
+    }
+    const c = s.charCodeAt(pos);
+    if (c === 44) {
+      pos += 1;
+      fEnded = COMMA;
+      fEmitted = qEmitted;
+      return;
+    }
+    if (s.charCodeAt(pos) === 92 && s.charCodeAt(pos + 1) === 110) {
+      pos += 2;
+      line += 1;
+      fEnded = LINE_BREAK;
+      fEmitted = qEmitted;
+      return;
+    }
+    if (
+      s.charCodeAt(pos) === 92 &&
+      s.charCodeAt(pos + 1) === 114 &&
+      s.charCodeAt(pos + 2) === 92 &&
+      s.charCodeAt(pos + 3) === 110
+    ) {
+      pos += 4;
+      line += 1;
+      fEnded = LINE_BREAK;
+      fEmitted = qEmitted;
+      return;
+    }
+    // What follows the closing quote is appended as it stands.
+    readUnquotedRaw();
+    if (fAdded > 0) errs.push(errJson('quote_junk'));
+    fEmitted = qEmitted + fEmitted;
+    fEmpty = false;
+    // fEnded / fAdded stay the junk read's; fQuoted stays the field's.
+  }
+
+  // Reads a quoted field whose opening quote is at pos, when it holds a doubled
+  // quote or a line break inside it.
+  function readQuotedGeneralRaw(open, openLine) {
+    let p = open + 2;
+    let segStart = p;
+    let rawParts = null; // the field's raw segments, in order
+    let segBreaks = 0; // line breaks the segments hold
+    let segHasRN = false; // a segment holds a \r or \n escape
+    let segHasDbl = false; // a segment holds a literal backslash (\\)
+    // Scans one segment's escapes once: counts its line breaks, flags a
+    // literal backslash, throws on \u. Pushes the segment as it stands.
+    function pushSeg(seg) {
+      let i = seg.indexOf('\\');
+      while (i !== -1) {
+        const t = seg.charCodeAt(i + 1);
+        if (t === 117) throw FALLBACK;
+        if (t === 92) {
+          segHasDbl = true;
+          i = seg.indexOf('\\', i + 2);
+          continue;
+        }
+        if (t === 114) {
+          segBreaks += 1;
+          segHasRN = true;
+          if (seg.charCodeAt(i + 2) === 92 && seg.charCodeAt(i + 3) === 110) i = seg.indexOf('\\', i + 4);
+          else i = seg.indexOf('\\', i + 2);
+          continue;
+        }
+        if (t === 110) {
+          segBreaks += 1;
+          segHasRN = true;
+          i = seg.indexOf('\\', i + 2);
+          continue;
+        }
+        i = seg.indexOf('\\', i + 2);
+      }
+      if (rawParts === null) rawParts = [];
+      rawParts.push(seg);
+    }
+    for (;;) {
+      const q = s.indexOf('\\"', p);
+      if (q === -1 || q >= end) {
+        // The quote never closes: literal, re-read as unquoted.
+        pos = open + 2;
+        line = openLine;
+        errs.push(errJson('unterminated_quote'));
+        readUnquotedRaw();
+        fEmitted = '\\"' + fEmitted;
+        fEmpty = false;
+        fQuoted = true;
+        return;
+      }
+      if (s.charCodeAt(q + 2) === 92 && s.charCodeAt(q + 3) === 34) {
+        // A doubled quote: one literal quote, and the field goes on.
+        pushSeg(s.slice(segStart, q));
+        p = q + 4;
+        segStart = p;
+        continue;
+      }
+      pushSeg(s.slice(segStart, q));
+      pos = q + 2;
+      line += segBreaks;
+      fQuoted = true;
+      if (segHasDbl) {
+        // A literal backslash inside: decode the field the safe way.
+        const dec = decodeRawSpan(rawParts.join('\\"\\"'));
+        const conv = dec.replaceAll('""', '"').replace(/\r\n?/g, '\n');
+        afterQuoteRaw(JSON.stringify(conv).slice(1, -1));
+        return;
+      }
+      let joined = rawParts.join('\\"');
+      if (segHasRN) joined = joined.split('\\r\\n').join('\\n').split('\\r').join('\\n');
+      afterQuoteRaw(joined);
+      return;
+    }
+  }
+
+  // Reads a quoted field whose opening quote is at pos.
+  function readQuotedRaw() {
+    const open = pos;
+    const openLine = line;
+    const p = open + 2;
+    const q = s.indexOf('\\"', p);
+    if (q === -1 || q >= end) {
+      pos = open + 2;
+      line = openLine;
+      errs.push(errJson('unterminated_quote'));
+      readUnquotedRaw();
+      fEmitted = '\\"' + fEmitted;
+      fEmpty = false;
+      fQuoted = true;
+      return;
+    }
+    if (s.charCodeAt(q + 2) === 92 && s.charCodeAt(q + 3) === 34) {
+      readQuotedGeneralRaw(open, openLine);
+      return;
+    }
+    // The first quote is the closing one, unless a line break sits inside it.
+    const inner = s.slice(p, q);
+    let dirty = false;
+    let hasDbl = false;
+    let breaks = 0;
+    let b = inner.indexOf('\\');
+    while (b !== -1) {
+      const t = inner.charCodeAt(b + 1);
+      if (t === 117) throw FALLBACK;
+      if (t === 92) {
+        hasDbl = true;
+        b = inner.indexOf('\\', b + 2);
+        continue;
+      }
+      if (t === 114) {
+        dirty = true;
+        breaks += 1;
+        if (inner.charCodeAt(b + 2) === 92 && inner.charCodeAt(b + 3) === 110) b = inner.indexOf('\\', b + 4);
+        else b = inner.indexOf('\\', b + 2);
+        continue;
+      }
+      if (t === 110) {
+        dirty = true;
+        breaks += 1;
+        b = inner.indexOf('\\', b + 2);
+        continue;
+      }
+      b = inner.indexOf('\\', b + 2);
+    }
+    pos = q + 2;
+    fQuoted = true;
+    if (!dirty) {
+      afterQuoteRaw(inner);
+      return;
+    }
+    line += breaks;
+    if (hasDbl) {
+      const dec = decodeRawSpan(inner);
+      const conv = dec.replace(/\r\n?/g, '\n');
+      afterQuoteRaw(JSON.stringify(conv).slice(1, -1));
+      return;
+    }
+    afterQuoteRaw(inner.split('\\r\\n').join('\\n').split('\\r').join('\\n'));
+  }
+
+  // Finalises one record: rowJson is the row's JSON (already cut to width when
+  // long), fieldCount its field count, extraJson the cut fields' JSON (or null).
+  function finishRecord(rowJson, fieldCount, extraJson) {
+    if (width < 0) {
+      width = fieldCount;
+      if (header) {
+        columnsJson = rowJson;
+        return;
+      }
+      rowsParts.push(rowJson);
+      rowsCount += 1;
+      return;
+    }
+    if (fieldCount < width) {
+      errs.push(errJson('short_row', ',"fields":' + fieldCount));
+      rowJson = rowJson.slice(0, -1) + ',""'.repeat(width - fieldCount) + ']';
+    } else if (fieldCount > width) {
+      errs.push(errJson('long_row', ',"extra":' + extraJson));
+    }
+    if (header && columnsJson === null) {
+      columnsJson = rowJson;
+      return;
+    }
+    rowsParts.push(rowJson);
+    rowsCount += 1;
+  }
+
+  for (;;) {
+    // Lines with no characters are no records.
+    while (pos < end) {
+      if (s.charCodeAt(pos) === 92 && s.charCodeAt(pos + 1) === 110) {
+        pos += 2;
+        line += 1;
+      } else if (
+        s.charCodeAt(pos) === 92 &&
+        s.charCodeAt(pos + 1) === 114 &&
+        s.charCodeAt(pos + 2) === 92 &&
+        s.charCodeAt(pos + 3) === 110
+      ) {
+        pos += 4;
+        line += 1;
+      } else {
+        break;
+      }
+    }
+    if (pos >= end) break;
+
+    recordLine = line;
+    recordRow = header && columnsJson === null ? null : rowsCount;
+    const fields = [];
+    let quoted = false;
+    do {
+      quoted = s.charCodeAt(pos) === 92 && s.charCodeAt(pos + 1) === 34;
+      if (quoted) readQuotedRaw();
+      else readUnquotedRaw();
+      fields.push(fEmitted);
+    } while (fEnded === COMMA);
+
+    // A line that held only stray CRs is left with no characters: no record.
+    if (fields.length === 1 && fEmpty && !quoted) continue;
+
+    const fieldCount = fields.length;
+    let rowJson;
+    let extraJson = null;
+    if (width >= 0 && fieldCount > width) {
+      rowJson = '["' + fields.slice(0, width).join('","') + '"]';
+      extraJson = '["' + fields.slice(width).join('","') + '"]';
+    } else {
+      rowJson = '["' + fields.join('","') + '"]';
+    }
+    finishRecord(rowJson, fieldCount, extraJson);
+  }
+
+  return (
+    '{"columns":' +
+    (header ? columnsJson ?? '[]' : 'null') +
+    ',"rows":[' +
+    rowsParts.join(',') +
+    '],"errors":[' +
+    errs.join(',') +
+    ']}'
+  );
+}
